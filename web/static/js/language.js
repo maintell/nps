@@ -56,16 +56,33 @@
 		if (flag) { return {'value':(langobj[languages['current']] || langobj[languages['default']] || 'N/A')}}
 	}
 
+	// Match a browser language (e.g. "zh", "zh-TW", "en-GB") to an available
+	// menu language key (e.g. "zh-CN", "en-US"). Exact match wins, then the
+	// primary subtag (before the first "-"). Returns null when nothing matches
+	// so the caller can fall back to the default language.
+	function normalizeLang (lang) {
+		if (!lang) return null;
+		var lower = ('' + lang).toLowerCase();
+		var primary = lower.split('-')[0];
+		var fallback = null;
+		for (var key in languages['menu']) {
+			var k = key.toLowerCase();
+			if (k === lower) return key;
+			if (fallback == null && k.split('-')[0] === primary) fallback = key;
+		}
+		return fallback;
+	}
+
 	$.fn.cloudLang = function () {
 		$.ajax({
 			type: 'GET',
-			url: window.nps.web_base_url + '/static/page/languages.xml?v=20240227',
+			url: window.nps.web_base_url + '/static/page/languages.xml?v=' + window.nps.version,
 			dataType: 'xml',
 			success: function (xml) {
 				languages['content'] = xml2json($(xml).children())['content'];
 				languages['menu'] = languages['content']['languages'];
 				languages['default'] = languages['content']['default'];
-				languages['navigator'] = (getCookie ('lang') || navigator.language || navigator.browserLanguage);
+				languages['navigator'] = (getCookie ('lang') || normalizeLang(navigator.language || navigator.browserLanguage) || languages['default']);
 				for(var key in languages['menu']){
 					$('#languagemenu').next().append('<li lang="' + key + '"><a><img src="' + window.nps.web_base_url + '/static/img/flag/' + key + '.png"> ' + languages['menu'][key] +'</a></li>');
 					if ( key == languages['navigator'] ) languages['current'] = key;
@@ -76,11 +93,11 @@
 		});
 	};
 
-	$.fn.setLang = function (dom) {
+	$.fn.setLang = function (dom, persistLang) {
 		languages['current'] = $('#languagemenu').attr('lang');
 		if ( dom == '' ) {
 			$('#languagemenu span').text(' ' + languages['menu'][languages['current']]);
-			if (languages['current'] != getCookie('lang')) setCookie('lang', languages['current']);
+			if (persistLang && languages['current'] != getCookie('lang')) setCookie('lang', languages['current'], 36500);
 			if($("#table").length>0) $('#table').bootstrapTable('refreshOptions', { 'locale': languages['current']});
 		}
 		$.each($(dom + ' [langtag]'), function (i, item) {
@@ -122,7 +139,10 @@ $(document).ready(function () {
 	$('body').cloudLang();
 	$('body').on('click','li[lang]',function(){
 		$('#languagemenu').attr('lang',$(this).attr('lang'));
-		$('body').setLang ('');
+		$('body').setLang ('', true);
+	});
+	$('body').on('input change', '[data-required="true"]', function () {
+		$(this).removeClass('is-invalid');
 	});
 });
 
@@ -132,24 +152,54 @@ var chartdatas = {};
 var postsubmit;
 
 function langreply(langstr) {
+    if (!languages || !languages['content'] || !languages['content']['reply']) return langstr;
     var langobj = languages['content']['reply'][langstr.replace(/[\s,\.\?]*/g,"").toLowerCase()];
     if ($.type(langobj) == 'undefined') return langstr
     langobj = (langobj[languages['current']] || langobj[languages['default']] || langstr);
     return langobj
 }
 
+function validateRequiredFields(formSelector) {
+    var $form = $(formSelector || 'form').first();
+    if ($form.length === 0) return true;
+
+    var $fields = $form.find('[data-required="true"]').filter(':visible');
+    $fields.removeClass('is-invalid');
+
+    var $invalid = $fields.filter(function () {
+        return $.trim($(this).val()) === '';
+    });
+    if ($invalid.length === 0) return true;
+
+    $invalid.addClass('is-invalid');
+    var msg = 'Please fill in the required fields';
+    if (languages && languages['content'] && languages['content']['info-requiredfields']) {
+        var requiredMsg = languages['content']['info-requiredfields'];
+        msg = requiredMsg[languages['current']] || requiredMsg[languages['default']] || msg;
+    }
+    alert(msg);
+    $invalid.first().focus();
+    return false;
+}
+
+var nps_submitting = false;
+var nps_batch_submitting = false;
 function submitform(action, url, postdata) {
+    if (nps_submitting) return;
+    if ((action === 'add' || action === 'edit') && !validateRequiredFields('form')) return;
     postsubmit = false;
     switch (action) {
         case 'start':
         case 'stop':
         case 'delete':
-            var langobj = languages['content']['confirm'][action];
-            action = (langobj[languages['current']] || langobj[languages['default']] || 'Are you sure you want to ' + action + ' it?');
-            if (! confirm(action)) return;
+		case 'copy':
+            var confirmObj = (languages && languages['content'] && languages['content']['confirm']) ? languages['content']['confirm'][action] : null;
+            var confirmMsg = (confirmObj && (confirmObj[languages['current']] || confirmObj[languages['default']])) || ('Are you sure you want to ' + action + ' it?');
+            if (! confirm(confirmMsg)) return;
             postsubmit = true;
         case 'add':
         case 'edit':
+            nps_submitting = true;
             $.ajax({
                 type: "POST",
                 url: url,
@@ -157,12 +207,20 @@ function submitform(action, url, postdata) {
                 success: function (res) {
                     alert(langreply(res.msg));
                     if (res.status) {
-                        if (postsubmit) {document.location.reload();}else{history.back(-1);}
+                        if (postsubmit) {
+							document.location.reload();
+						}else{
+							window.location.href= document.referrer
+						}
                     }
+                },
+                complete: function () {
+                    nps_submitting = false;
                 }
             });
 			return;
 		case 'global':
+			nps_submitting = true;
 			$.ajax({
 				type: "POST",
 				url: url,
@@ -172,6 +230,9 @@ function submitform(action, url, postdata) {
 					if (res.status) {
 						document.location.reload();
 					}
+				},
+				complete: function () {
+					nps_submitting = false;
 				}
 			});
     }
@@ -196,4 +257,45 @@ function changeunit(limit) {
         return sizeStr.substring(0, index) + sizeStr.substr(index + 3, 2);
     }
     return size;
+}
+
+function batchDelete(url) {
+    var rows = $('#table').bootstrapTable('getSelections');
+    if (rows.length === 0) {
+        alert(languages && languages['content'] && languages['content']['confirm'] && languages['content']['confirm']['noselected']
+            ? (languages['content']['confirm']['noselected'][languages['current']] || languages['content']['confirm']['noselected'][languages['default']] || 'Please select items to delete.')
+            : 'Please select items to delete.');
+        return;
+    }
+    var confirmObj = (languages && languages['content'] && languages['content']['confirm']) ? languages['content']['confirm']['delete'] : null;
+    var confirmMsg = (confirmObj && (confirmObj[languages['current']] || confirmObj[languages['default']])) || ('Are you sure you want to delete ' + rows.length + ' items?');
+    if (!confirm(confirmMsg + ' (' + rows.length + ' ' + (rows.length > 1 ? 'items' : 'item') + ')')) return;
+    if (nps_batch_submitting) return;
+    nps_batch_submitting = true;
+    var ids = [];
+    for (var i = 0; i < rows.length; i++) {
+        ids.push(rows[i].Id);
+    }
+    var idx = 0;
+    function next() {
+        if (idx >= ids.length) {
+            nps_batch_submitting = false;
+            document.location.reload();
+            return;
+        }
+        $.ajax({
+            type: "POST",
+            url: url,
+            data: { id: ids[idx] },
+            success: function (res) {
+                idx++;
+                next();
+            },
+            error: function () {
+                idx++;
+                next();
+            }
+        });
+    }
+    next();
 }

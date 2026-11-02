@@ -5,11 +5,13 @@ import (
 	"github.com/astaxie/beego/utils/captcha"
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
 	"ehang.io/nps/lib/common"
 	"ehang.io/nps/lib/file"
+	"ehang.io/nps/lib/version"
 	"ehang.io/nps/server"
 	"github.com/astaxie/beego"
 )
@@ -26,10 +28,22 @@ type record struct {
 	lastLoginTime     time.Time
 }
 
-func init() {
+// InitCaptcha registers the captcha image route and the create_captcha template
+// function. The image URL prefix must include web_base_url, otherwise the login
+// page would request the captcha from the site root and fail behind a reverse
+// proxy that only forwards the web_base_url sub path.
+//
+// It must be called after beego.LoadAppConfig, so it cannot live in init():
+// package init() runs before main() loads conf/nps.conf, where web_base_url
+// would still be empty.
+func InitCaptcha() {
 	// use beego cache system store the captcha data
 	store := cache.NewMemoryCache()
-	cpt = captcha.NewWithFilter("/captcha/", store)
+	base := strings.TrimSuffix(beego.AppConfig.String("web_base_url"), "/")
+	if base != "" && !strings.HasPrefix(base, "/") {
+		base = "/" + base
+	}
+	cpt = captcha.NewWithFilter(base+"/captcha/", store)
 }
 
 func (self *LoginController) Index() {
@@ -39,15 +53,17 @@ func (self *LoginController) Index() {
 		self.Redirect(webBaseUrl+"/index/index", 302)
 	}
 	self.Data["web_base_url"] = webBaseUrl
-	self.Data["register_allow"], _ = beego.AppConfig.Bool("allow_user_register")
-	self.Data["captcha_open"], _ = beego.AppConfig.Bool("open_captcha")
+	globalSettings := file.GetDb().GetGlobalSettings()
+	self.Data["register_allow"] = globalSettings.AllowUserRegister
+	self.Data["captcha_open"] = globalSettings.OpenCaptcha
+	self.Data["version"] = version.VERSION
 	self.TplName = "login/index.html"
 }
 
 func (self *LoginController) Verify() {
 	username := self.GetString("username")
 	password := self.GetString("password")
-	captchaOpen, _ := beego.AppConfig.Bool("open_captcha")
+	captchaOpen := file.GetDb().GetGlobalSettings().OpenCaptcha
 	if captchaOpen {
 		if !cpt.VerifyReq(self.Ctx.Request) {
 			self.Data["json"] = map[string]interface{}{"status": 0, "msg": "the verification code is wrong, please get it again and try again"}
@@ -82,8 +98,8 @@ func (self *LoginController) doLogin(username, password string, explicit bool) b
 		auth = true
 		server.Bridge.Register.Store(common.GetIpByAddr(self.Ctx.Input.IP()), time.Now().Add(time.Hour*time.Duration(2)))
 	}
-	b, err := beego.AppConfig.Bool("allow_user_login")
-	if err == nil && b && !auth {
+	allowUserLogin := file.GetDb().GetGlobalSettings().AllowUserLogin
+	if allowUserLogin && !auth {
 		file.GetDb().JsonDb.Clients.Range(func(key, value interface{}) bool {
 			v := value.(*file.Client)
 			if !v.Status || v.NoDisplay {
@@ -125,9 +141,10 @@ func (self *LoginController) doLogin(username, password string, explicit bool) b
 func (self *LoginController) Register() {
 	if self.Ctx.Request.Method == "GET" {
 		self.Data["web_base_url"] = beego.AppConfig.String("web_base_url")
+		self.Data["version"] = version.VERSION
 		self.TplName = "login/register.html"
 	} else {
-		if b, err := beego.AppConfig.Bool("allow_user_register"); err != nil || !b {
+		if !file.GetDb().GetGlobalSettings().AllowUserRegister {
 			self.Data["json"] = map[string]interface{}{"status": 0, "msg": "register is not allow"}
 			self.ServeJSON()
 			return
@@ -138,7 +155,6 @@ func (self *LoginController) Register() {
 			return
 		}
 		t := &file.Client{
-			Id:          int(file.GetDb().JsonDb.GetClientId()),
 			Status:      true,
 			Cnf:         &file.Config{},
 			WebUserName: self.GetString("username"),

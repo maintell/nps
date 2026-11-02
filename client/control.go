@@ -2,12 +2,12 @@ package client
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/rand"
@@ -147,7 +147,7 @@ re:
 		}
 		vkey = string(b)
 	}
-	ioutil.WriteFile(filepath.Join(common.GetTmpPath(), "npc_vkey.txt"), []byte(vkey), 0600)
+	os.WriteFile(filepath.Join(common.GetTmpPath(), "npc_vkey.txt"), []byte(vkey), 0600)
 
 	//send hosts to server
 	for _, v := range cnf.Hosts {
@@ -224,6 +224,23 @@ func NewConn(tp string, vkey string, server string, connType string, proxyUrl st
 			} else {
 				connection, err = net.Dial("tcp", server)
 			}
+
+			//header := &proxyproto.Header{
+			//	Version:           1,
+			//	Command:           proxyproto.PROXY,
+			//	TransportProtocol: proxyproto.TCPv4,
+			//	SourceAddr: &net.TCPAddr{
+			//		IP:   net.ParseIP("10.1.1.1"),
+			//		Port: 1000,
+			//	},
+			//	DestinationAddr: &net.TCPAddr{
+			//		IP:   net.ParseIP("20.2.2.2"),
+			//		Port: 2000,
+			//	},
+			//}
+			//
+			//_, err = header.WriteTo(connection)
+			//_, err = io.WriteString(connection, "HELO")
 		}
 	} else {
 		sess, err = kcp.DialWithOptions(server, nil, 10, 3)
@@ -253,8 +270,8 @@ func NewConn(tp string, vkey string, server string, connType string, proxyUrl st
 		return nil, err
 	}
 	if crypt.Md5(version.GetVersion()) != string(b) {
-		logs.Error("The client does not match the server version. The current core version of the client is", version.GetVersion())
-		return nil, err
+		//logs.Error("The client does not match the server version. The current core version of the client is", version.GetVersion())
+		//return nil, err
 	}
 	if _, err := c.Write([]byte(common.Getverifyval(vkey))); err != nil {
 		return nil, err
@@ -272,7 +289,7 @@ func NewConn(tp string, vkey string, server string, connType string, proxyUrl st
 	return c, nil
 }
 
-//http proxy connection
+// http proxy connection
 func NewHttpProxyConn(url *url.URL, remoteAddr string) (net.Conn, error) {
 	req, err := http.NewRequest("CONNECT", "http://"+remoteAddr, nil)
 	if err != nil {
@@ -299,7 +316,7 @@ func NewHttpProxyConn(url *url.URL, remoteAddr string) (net.Conn, error) {
 	return proxyConn, nil
 }
 
-//get a basic auth string
+// get a basic auth string
 func basicAuth(username, password string) string {
 	auth := username + ":" + password
 	return base64.StdEncoding.EncodeToString([]byte(auth))
@@ -326,6 +343,7 @@ func handleP2PUdp(localAddr, rAddr, md5Password, role string) (remoteAddress str
 	if err != nil {
 		return
 	}
+	defer localConn.Close()
 	err = getRemoteAddressFromServer(rAddr, localConn, md5Password, role, 0)
 	if err != nil {
 		logs.Error(err)
@@ -342,27 +360,32 @@ func handleP2PUdp(localAddr, rAddr, md5Password, role string) (remoteAddress str
 		return
 	}
 	var remoteAddr1, remoteAddr2, remoteAddr3 string
+	// 修复：添加超时，避免无限等待远端响应
+	localConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	buf := make([]byte, 1024)
 	for {
-		buf := make([]byte, 1024)
-		if n, addr, er := localConn.ReadFromUDP(buf); er != nil {
-			err = er
+		var n int
+		var addr *net.UDPAddr
+		n, addr, err = localConn.ReadFromUDP(buf)
+		if err != nil {
+			localConn.SetReadDeadline(time.Time{})
 			return
-		} else {
-			rAddr2, _ := getNextAddr(rAddr, 1)
-			rAddr3, _ := getNextAddr(rAddr, 2)
-			switch addr.String() {
-			case rAddr:
-				remoteAddr1 = string(buf[:n])
-			case rAddr2:
-				remoteAddr2 = string(buf[:n])
-			case rAddr3:
-				remoteAddr3 = string(buf[:n])
-			}
+		}
+		rAddr2, _ := getNextAddr(rAddr, 1)
+		rAddr3, _ := getNextAddr(rAddr, 2)
+		switch addr.String() {
+		case rAddr:
+			remoteAddr1 = string(buf[:n])
+		case rAddr2:
+			remoteAddr2 = string(buf[:n])
+		case rAddr3:
+			remoteAddr3 = string(buf[:n])
 		}
 		if remoteAddr1 != "" && remoteAddr2 != "" && remoteAddr3 != "" {
 			break
 		}
 	}
+	localConn.SetReadDeadline(time.Time{})
 	if remoteAddress, err = sendP2PTestMsg(localConn, remoteAddr1, remoteAddr2, remoteAddr3); err != nil {
 		return
 	}
@@ -372,9 +395,8 @@ func handleP2PUdp(localAddr, rAddr, md5Password, role string) (remoteAddress str
 
 func sendP2PTestMsg(localConn *net.UDPConn, remoteAddr1, remoteAddr2, remoteAddr3 string) (string, error) {
 	logs.Trace(remoteAddr3, remoteAddr2, remoteAddr1)
-	defer localConn.Close()
-	isClose := false
-	defer func() { isClose = true }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	interval, err := getAddrInterval(remoteAddr1, remoteAddr2, remoteAddr3)
 	if err != nil {
 		return "", err
@@ -393,10 +415,9 @@ func sendP2PTestMsg(localConn *net.UDPConn, remoteAddr1, remoteAddr2, remoteAddr
 		defer ticker.Stop()
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-ticker.C:
-				if isClose {
-					return
-				}
 				if _, err := localConn.WriteTo([]byte(common.WORK_P2P_CONNECT), remoteUdpAddr); err != nil {
 					return
 				}
@@ -419,10 +440,9 @@ func sendP2PTestMsg(localConn *net.UDPConn, remoteAddr1, remoteAddr2, remoteAddr
 					defer ticker.Stop()
 					for {
 						select {
+						case <-ctx.Done():
+							return
 						case <-ticker.C:
-							if isClose {
-								return
-							}
 							if _, err := localConn.WriteTo([]byte(common.WORK_P2P_CONNECT), remoteUdpAddr); err != nil {
 								return
 							}
@@ -535,13 +555,13 @@ func getRandomPortArr(min, max int) []int {
 	for i := min; i <= max; i++ {
 		addrAddr[max-i] = i
 	}
-	rand.Seed(time.Now().UnixNano())
-	var r, temp int
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	var ri, temp int
 	for i := max - min; i > 0; i-- {
-		r = rand.Int() % i
+		ri = r.Int() % i
 		temp = addrAddr[i]
-		addrAddr[i] = addrAddr[r]
-		addrAddr[r] = temp
+		addrAddr[i] = addrAddr[ri]
+		addrAddr[ri] = temp
 	}
 	return addrAddr
 }

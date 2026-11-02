@@ -1,12 +1,13 @@
 package file
 
 import (
+	"crypto/md5"
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"ehang.io/nps/lib/common"
 	"ehang.io/nps/lib/crypt"
@@ -22,7 +23,7 @@ var (
 	once sync.Once
 )
 
-//init csv from file
+// init csv from file
 func GetDb() *DbUtils {
 	once.Do(func() {
 		jsonDb := NewJsonDb(common.GetRunPath())
@@ -35,43 +36,42 @@ func GetDb() *DbUtils {
 	return Db
 }
 
-func GetMapKeys(m sync.Map, isSort bool, sortKey, order string) (keys []int) {
-	if sortKey != "" && isSort {
-		return sortClientByKey(m, sortKey, order)
-	}
-	m.Range(func(key, value interface{}) bool {
-		keys = append(keys, key.(int))
+func (s *DbUtils) GetClientList(start, length int, search, sortField, order string, clientId int) ([]*Client, int) {
+	all := make([]*Client, 0)
+	s.JsonDb.Clients.Range(func(key, value interface{}) bool {
+		v := value.(*Client)
+		if v.NoDisplay {
+			return true
+		}
+		if clientId != 0 && clientId != v.Id {
+			return true
+		}
+		if search != "" && !(v.Id == common.GetIntNoErrByStr(search) || strings.Contains(v.VerifyKey, search) || strings.Contains(v.Remark, search) || strings.Contains(v.Addr, search) || strings.Contains(v.LocalAddr, search)) {
+			return true
+		}
+		all = append(all, v)
 		return true
 	})
-	sort.Ints(keys)
-	return
+	SortClients(all, sortField, order)
+	return paginateClients(all, start, length)
 }
 
-func (s *DbUtils) GetClientList(start, length int, search, sort, order string, clientId int) ([]*Client, int) {
-	list := make([]*Client, 0)
-	var cnt int
-	keys := GetMapKeys(s.JsonDb.Clients, true, sort, order)
-	for _, key := range keys {
-		if value, ok := s.JsonDb.Clients.Load(key); ok {
-			v := value.(*Client)
-			if v.NoDisplay {
-				continue
-			}
-			if clientId != 0 && clientId != v.Id {
-				continue
-			}
-			if search != "" && !(v.Id == common.GetIntNoErrByStr(search) || strings.Contains(v.VerifyKey, search) || strings.Contains(v.Remark, search)) {
-				continue
-			}
-			cnt++
-			if start--; start < 0 {
-				if length--; length >= 0 {
-					list = append(list, v)
-				}
-			}
-		}
+func paginateClients(all []*Client, start, length int) ([]*Client, int) {
+	cnt := len(all)
+	if start < 0 {
+		start = 0
 	}
-	return list, cnt
+	if length <= 0 {
+		return []*Client{}, cnt
+	}
+	if start >= cnt {
+		return []*Client{}, cnt
+	}
+	end := start + length
+	if end > cnt {
+		end = cnt
+	}
+	return all[start:end], cnt
 }
 
 func (s *DbUtils) GetIdByVerifyKey(vKey string, addr string) (id int, err error) {
@@ -95,7 +95,7 @@ func (s *DbUtils) GetIdByVerifyKey(vKey string, addr string) (id int, err error)
 func (s *DbUtils) NewTask(t *Tunnel) (err error) {
 	s.JsonDb.Tasks.Range(func(key, value interface{}) bool {
 		v := value.(*Tunnel)
-		if (v.Mode == "secret" || v.Mode == "p2p") && v.Password == t.Password {
+		if (v.Mode == "secret" || v.Mode == "p2p") && v.Password == t.Password && t.Password != "" {
 			err = errors.New(fmt.Sprintf("secret mode keys %s must be unique", t.Password))
 			return false
 		}
@@ -104,8 +104,21 @@ func (s *DbUtils) NewTask(t *Tunnel) (err error) {
 	if err != nil {
 		return
 	}
-	t.Flow = new(Flow)
+	if t.Flow == nil {
+		t.Flow = new(Flow)
+	}
+	taskIdLock.Lock()
+	if t.Id == 0 {
+		// Same rule as clients: persisted rows use the auto-increment id,
+		// temporary rows use their own decreasing id space.
+		if t.NoStore {
+			t.Id = getTransientTaskId()
+		} else {
+			t.Id = int(s.JsonDb.GetTaskId())
+		}
+	}
 	s.JsonDb.Tasks.Store(t.Id, t)
+	taskIdLock.Unlock()
 	s.JsonDb.StoreTasksToJsonFile()
 	return
 }
@@ -123,12 +136,31 @@ func (s *DbUtils) SaveGlobal(t *Glob) error {
 }
 
 func (s *DbUtils) DelTask(id int) error {
+	taskIdLock.Lock()
 	s.JsonDb.Tasks.Delete(id)
+	if !s.hasPersistedTaskLocked() {
+		atomic.StoreInt32(&s.JsonDb.TaskIncreaseId, 0)
+	}
+	taskIdLock.Unlock()
 	s.JsonDb.StoreTasksToJsonFile()
 	return nil
 }
 
-//md5 password
+// hasPersistedTaskLocked reports whether any tunnel would be written to the
+// data file. The caller must hold taskIdLock.
+func (s *DbUtils) hasPersistedTaskLocked() bool {
+	found := false
+	s.JsonDb.Tasks.Range(func(key, value interface{}) bool {
+		if !value.(*Tunnel).NoStore {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// md5 password
 func (s *DbUtils) GetTaskByMd5Password(p string) (t *Tunnel) {
 	s.JsonDb.Tasks.Range(func(key, value interface{}) bool {
 		if crypt.Md5(value.(*Tunnel).Password) == p {
@@ -150,9 +182,28 @@ func (s *DbUtils) GetTask(id int) (t *Tunnel, err error) {
 }
 
 func (s *DbUtils) DelHost(id int) error {
+	hostIdLock.Lock()
 	s.JsonDb.Hosts.Delete(id)
+	if !s.hasPersistedHostLocked() {
+		atomic.StoreInt32(&s.JsonDb.HostIncreaseId, 0)
+	}
+	hostIdLock.Unlock()
 	s.JsonDb.StoreHostToJsonFile()
 	return nil
+}
+
+// hasPersistedHostLocked reports whether any host would be written to the
+// data file. The caller must hold hostIdLock.
+func (s *DbUtils) hasPersistedHostLocked() bool {
+	found := false
+	s.JsonDb.Hosts.Range(func(key, value interface{}) bool {
+		if !value.(*Host).NoStore {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func (s *DbUtils) IsHostExist(h *Host) bool {
@@ -175,40 +226,121 @@ func (s *DbUtils) NewHost(t *Host) error {
 	if s.IsHostExist(t) {
 		return errors.New("host has exist")
 	}
-	t.Flow = new(Flow)
+	if t.Flow == nil {
+		t.Flow = new(Flow)
+	}
+	hostIdLock.Lock()
+	if t.Id == 0 {
+		if t.NoStore {
+			t.Id = getTransientHostId()
+		} else {
+			t.Id = int(s.JsonDb.GetHostId())
+		}
+	}
 	s.JsonDb.Hosts.Store(t.Id, t)
+	hostIdLock.Unlock()
 	s.JsonDb.StoreHostToJsonFile()
 	return nil
 }
 
-func (s *DbUtils) GetHost(start, length int, id int, search string) ([]*Host, int) {
-	list := make([]*Host, 0)
-	var cnt int
-	keys := GetMapKeys(s.JsonDb.Hosts, false, "", "")
-	for _, key := range keys {
-		if value, ok := s.JsonDb.Hosts.Load(key); ok {
-			v := value.(*Host)
-			if search != "" && !(v.Id == common.GetIntNoErrByStr(search) || strings.Contains(v.Host, search) || strings.Contains(v.Remark, search) || strings.Contains(v.Client.VerifyKey, search)) {
-				continue
+func (s *DbUtils) GetHost(start, length int, id int, search, sortField, order string) ([]*Host, int) {
+	all := make([]*Host, 0)
+	s.JsonDb.Hosts.Range(func(key, value interface{}) bool {
+		v := value.(*Host)
+		if search != "" {
+			vkey := ""
+			if v.Client != nil {
+				vkey = v.Client.VerifyKey
 			}
-			if id == 0 || v.Client.Id == id {
-				cnt++
-				if start--; start < 0 {
-					if length--; length >= 0 {
-						list = append(list, v)
-					}
-				}
+			if !(v.Id == common.GetIntNoErrByStr(search) || strings.Contains(v.Host, search) || strings.Contains(v.Remark, search) || strings.Contains(vkey, search)) {
+				return true
 			}
 		}
+		if id != 0 && (v.Client == nil || v.Client.Id != id) {
+			return true
+		}
+		all = append(all, v)
+		return true
+	})
+	SortHosts(all, sortField, order)
+	return paginateHosts(all, start, length)
+}
+
+func paginateHosts(all []*Host, start, length int) ([]*Host, int) {
+	cnt := len(all)
+	if start < 0 {
+		start = 0
 	}
-	return list, cnt
+	if length <= 0 {
+		return []*Host{}, cnt
+	}
+	if start >= cnt {
+		return []*Host{}, cnt
+	}
+	end := start + length
+	if end > cnt {
+		end = cnt
+	}
+	return all[start:end], cnt
 }
 
 func (s *DbUtils) DelClient(id int) error {
+	clientIdLock.Lock()
 	s.JsonDb.Clients.Delete(id)
+	// A database id only moves forward while rows exist. Once the last
+	// persisted client is gone the data file is empty, so numbering may
+	// safely restart from 1.
+	if !s.hasPersistedClientLocked() {
+		atomic.StoreInt32(&s.JsonDb.ClientIncreaseId, 0)
+	}
+	clientIdLock.Unlock()
 	s.JsonDb.StoreClientsToJsonFile()
 	return nil
 }
+
+// hasPersistedClientLocked reports whether any client would be written to the
+// data file. NoStore clients use their own negative id space and do not count.
+// The caller must hold clientIdLock.
+func (s *DbUtils) hasPersistedClientLocked() bool {
+	found := false
+	s.JsonDb.Clients.Range(func(key, value interface{}) bool {
+		if !value.(*Client).NoStore {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// transClientId gives NoStore (temporary) clients their own decreasing id space.
+// They must not consume the persisted auto-increment id, otherwise every server
+// restart or public-vkey connection would leave a gap in the client numbering.
+var transClientId int32
+
+func getTransientClientId() int {
+	return int(atomic.AddInt32(&transClientId, -1))
+}
+
+var transTaskId int32
+
+func getTransientTaskId() int {
+	return int(atomic.AddInt32(&transTaskId, -1))
+}
+
+var transHostId int32
+
+func getTransientHostId() int {
+	return int(atomic.AddInt32(&transHostId, -1))
+}
+
+// The allocation locks keep "assign id + store" and "delete + reset counter"
+// atomic, so an empty data file can safely restart the ids from 1.
+var (
+	clientIdLock sync.Mutex
+	taskIdLock   sync.Mutex
+	hostIdLock   sync.Mutex
+)
 
 func (s *DbUtils) NewClient(c *Client) error {
 	var isNotSet bool
@@ -218,10 +350,10 @@ func (s *DbUtils) NewClient(c *Client) error {
 reset:
 	if c.VerifyKey == "" || isNotSet {
 		isNotSet = true
-		c.VerifyKey = crypt.GetRandomString(16)
+		c.VerifyKey = crypt.GetVkey()
 	}
 	if c.RateLimit == 0 {
-		c.Rate = rate.NewRate(int64(2 << 23))
+		c.Rate = rate.NewRate((2 << 23) * 1024)
 	} else if c.Rate == nil {
 		c.Rate = rate.NewRate(int64(c.RateLimit * 1024))
 	}
@@ -232,13 +364,21 @@ reset:
 		}
 		return errors.New("Vkey duplicate, please reset")
 	}
-	if c.Id == 0 {
-		c.Id = int(s.JsonDb.GetClientId())
-	}
 	if c.Flow == nil {
 		c.Flow = new(Flow)
 	}
+	clientIdLock.Lock()
+	if c.Id == 0 {
+		// Persisted clients keep the auto-increment behaviour of a database id:
+		// ids only move forward and are never reused after a deletion.
+		if c.NoStore {
+			c.Id = getTransientClientId()
+		} else {
+			c.Id = int(s.JsonDb.GetClientId())
+		}
+	}
 	s.JsonDb.Clients.Store(c.Id, c)
+	clientIdLock.Unlock()
 	s.JsonDb.StoreClientsToJsonFile()
 	return nil
 }
@@ -272,7 +412,7 @@ func (s *DbUtils) VerifyUserName(username string, id int) (res bool) {
 func (s *DbUtils) UpdateClient(t *Client) error {
 	s.JsonDb.Clients.Store(t.Id, t)
 	if t.RateLimit == 0 {
-		t.Rate = rate.NewRate(int64(2 << 23))
+		t.Rate = rate.NewRate(int64((2 << 23) * 1024))
 		t.Rate.Start()
 	}
 	return nil
@@ -317,6 +457,24 @@ func (s *DbUtils) GetClientIdByVkey(vkey string) (id int, err error) {
 	return
 }
 
+func (s *DbUtils) GetClientByVkey(vkey string) (c *Client, err error) {
+	var exist bool
+	s.JsonDb.Clients.Range(func(key, value interface{}) bool {
+		v := value.(*Client)
+		if fmt.Sprintf("%x", md5.Sum([]byte(v.VerifyKey))) == vkey {
+			exist = true
+			c = v
+			return false
+		}
+		return true
+	})
+	if exist {
+		return
+	}
+	err = errors.New("未找到客户端")
+	return
+}
+
 func (s *DbUtils) GetHostById(id int) (h *Host, err error) {
 	if v, ok := s.JsonDb.Hosts.Load(id); ok {
 		h = v.(*Host)
@@ -326,7 +484,7 @@ func (s *DbUtils) GetHostById(id int) (h *Host, err error) {
 	return
 }
 
-//get key by host from x
+// get key by host from x
 func (s *DbUtils) GetInfoByHost(host string, r *http.Request) (h *Host, err error) {
 	var hosts []*Host
 	//Handling Ported Access
@@ -357,6 +515,13 @@ func (s *DbUtils) GetInfoByHost(host string, r *http.Request) (h *Host, err erro
 		//If not set, default matches all
 		if v.Location == "" {
 			v.Location = "/"
+		}
+		// "*" means SNI-based HTTPS lookup where actual URI is unknown, skip location filter
+		if r.RequestURI == "*" {
+			if h == nil || (len(v.Location) > len(h.Location)) {
+				h = v
+			}
+			continue
 		}
 		if strings.Index(r.RequestURI, v.Location) == 0 {
 			if h == nil || (len(v.Location) > len(h.Location)) {
